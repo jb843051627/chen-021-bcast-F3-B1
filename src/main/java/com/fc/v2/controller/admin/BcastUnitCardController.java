@@ -77,4 +77,22 @@ public class BcastUnitCardController extends BaseController {
     public AjaxResult remove(String ids) {
         return toAjax(bcastUnitCardService.deleteTBcastUnitCardByIds(ids));
     }
+
+    @Log(title = "台站核点卡推进", action = "advance")
+    @ApiOperation(value = "推进一态", notes = "待核对→已核讫→已压卡")
+    @PostMapping("/advance")
+    @RequiresPermissions("bcast:bcastUnitCard:advance")
+    @ResponseBody
+    public AjaxResult advance(Long id) {
+        return toAjax(bcastUnitCardService.advanceTBcastUnitCard(id));
+    }
+
+    @Log(title = "台站核点卡退回", action = "revert")
+    @ApiOperation(value = "退回一态", notes = "仅已核讫可退回待核对")
+    @PostMapping("/revert")
+    @RequiresPermissions("bcast:bcastUnitCard:revert")
+    @ResponseBody
+    public AjaxResult revert(Long id) {
+        return toAjax(bcastUnitCardService.revertTBcastUnitCard(id));
+    }
 }

@@ -38,6 +38,9 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
     private static final int ST_CHECKED = 1;    // 已核对
     private static final int ST_FROZEN = 2;     // 已冻住（终态）
 
+    /** 历轮核验串的接链分隔符：第一轮串|退回后第二轮串|…，次序即先后 */
+    private static final String CHAIN_SEP = "|";
+
     @Autowired
     private TBcastSiteMapper bcastSiteMapper;
 
@@ -110,6 +113,16 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
         if (cur == null || cur.getDelFlag() == null || cur.getDelFlag().intValue() == 1) {
             return 0;
         }
+        // —— 状态机守卫：只有「待核对」能就地改；已核讫/已压卡后内容封死 ——
+        if (cur.getStatus() != null && cur.getStatus().intValue() != ST_PENDING) {
+            return 0;
+        }
+        // 系统字段一律以服务端状态机为准，封死从编辑口夹带改写的路子
+        // （status/nodeNo/content/delFlag 由立卡与推进/退回动作专管）
+        record.setStatus(null);
+        record.setNodeNo(null);
+        record.setContent(null);
+        record.setDelFlag(null);
         // 并发防重：换挂靠/改卡时仍要查在办卡冲突（排除自身）
         if (record.getSiteId() != null || record.getBillNo() != null) {
             TBcastUnitCard merged = new TBcastUnitCard();
@@ -153,9 +166,16 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
         }
         record.setUpdateBy(com.fc.v2.shiro.util.ShiroUtils.getLoginName());
         record.setUpdateTime(new Date());
-        return this.baseMapper.update(record, new UpdateWrapper<TBcastUnitCard>()
+        // 状态条件一并压进 UPDATE：读到待核、落笔前已被核讫的并发改动 0 行
+        UpdateWrapper<TBcastUnitCard> uw = new UpdateWrapper<TBcastUnitCard>()
                 .eq("id", record.getId())
-                .eq("del_flag", 0));
+                .eq("del_flag", 0);
+        if (cur.getStatus() == null) {
+            uw.and(w -> w.isNull("status").or().eq("status", ST_PENDING));
+        } else {
+            uw.eq("status", ST_PENDING);
+        }
+        return this.baseMapper.update(record, uw);
     }
 
     @Override
@@ -179,18 +199,26 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
         } else if (st.intValue() == ST_CHECKED) {
             next = ST_FROZEN;
         } else {
-            // 已冻住为终态，不得再推进
+            // 已压卡为终态，不得再推进
             return 0;
         }
+        // 条件压在当前态上，并发双点时只有一笔能成（状态机链）
         UpdateWrapper<TBcastUnitCard> uw = new UpdateWrapper<TBcastUnitCard>()
                 .eq("id", id).eq("del_flag", 0);
-        if (next == ST_CHECKED) {
-            // 核验串由当前版本序与卡内容一起压死，一次定形不可覆写
-            String checksum = checksumOf(cur);
-            uw.set("content", checksum);
-        } else if (next == ST_FROZEN) {
-            uw.set("content", cur.getContent());
+        // 存量旧卡 status 为空视同待核对：条件须容下 IS NULL，否则 NULL 行匹配不上
+        if (cur.getStatus() == null) {
+            uw.and(w -> w.isNull("status").or().eq("status", ST_PENDING));
+        } else {
+            uw.eq("status", st);
         }
+        if (next == ST_CHECKED) {
+            // 本轮核验串由当前版本序与卡内容一起压死，接在旧痕之后，历轮次序可辨、覆写不掉
+            String segment = checksumOf(cur);
+            String prior = cur.getContent();
+            String chain = (prior == null || prior.isEmpty()) ? segment : prior + CHAIN_SEP + segment;
+            uw.set("content", chain);
+        }
+        // 已核讫 → 已压卡：核验串原样封存，不动 content
         uw.set("status", next);
         uw.set("update_by", com.fc.v2.shiro.util.ShiroUtils.getLoginName());
         uw.set("update_time", new Date());
@@ -207,25 +235,41 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
             return 0;
         }
         Integer st = cur.getStatus();
-        if (st == null) {
-            st = ST_PENDING;
+        // —— 状态机守卫：只有「已核讫」能退一态回「待核对」；
+        //    待核对本身无可退、已压卡终态不可动、空状态旧卡不进此流程 ——
+        if (st == null || st.intValue() != ST_CHECKED) {
+            return 0;
         }
-        if (st.intValue() != ST_FROZEN) {
-            UpdateWrapper<TBcastUnitCard> uw = new UpdateWrapper<TBcastUnitCard>()
-                    .eq("id", id).eq("del_flag", 0);
-            uw.set("status", ST_PENDING);
-            uw.set("content", null);
-            uw.set("update_by", com.fc.v2.shiro.util.ShiroUtils.getLoginName());
-            uw.set("update_time", new Date());
-            return this.baseMapper.update(null, uw);
-        }
-        return 0;
+        // 条件压在「已核讫」上，并发双点只有一笔能成
+        UpdateWrapper<TBcastUnitCard> uw = new UpdateWrapper<TBcastUnitCard>()
+                .eq("id", id).eq("del_flag", 0).eq("status", ST_CHECKED);
+        uw.set("status", ST_PENDING);
+        // 先前核讫压死的核验串整笔保留（退回不抹痕），版本序进一档，
+        // 再核讫时新串以新版本序压出、接在旧痕之后，前后两轮分得清
+        Integer node = cur.getNodeNo();
+        int nextNode = (node == null || node <= 0) ? 2 : node + 1;
+        uw.set("node_no", nextNode);
+        uw.set("update_by", com.fc.v2.shiro.util.ShiroUtils.getLoginName());
+        uw.set("update_time", new Date());
+        return this.baseMapper.update(null, uw);
     }
 
     @Override
     public int deleteTBcastUnitCardByIds(String ids) {
         Long[] idArr = ConvertUtil.toLongArray(ids);
-        return this.baseMapper.deleteBatchIds(Arrays.asList(idArr));
+        // —— 状态机守卫：已核讫/已压卡的卡不得撤，整批里有一张不合规即整批驳回 ——
+        for (Long id : idArr) {
+            if (!isDeletable(id)) {
+                return 0;
+            }
+        }
+        // 状态条件压进 DELETE 本身，消除「查到可删、落笔前刚被核讫」的并发窗口
+        UpdateWrapper<TBcastUnitCard> dw = new UpdateWrapper<TBcastUnitCard>()
+                .in("id", Arrays.asList(idArr))
+                .eq("del_flag", 0)
+                .and(w -> w.isNull("status").or().eq("status", ST_PENDING));
+        int rows = this.baseMapper.delete(dw);
+        return rows == idArr.length ? rows : 0;
     }
 
     @Override
@@ -233,11 +277,23 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
         if (id == null) {
             return 0;
         }
-        TBcastUnitCard cur = this.baseMapper.selectById(id);
-        if (cur == null || cur.getDelFlag() == null || cur.getDelFlag().intValue() == 1) {
+        if (!isDeletable(id)) {
             return 0;
         }
-        return this.baseMapper.deleteById(id);
+        UpdateWrapper<TBcastUnitCard> dw = new UpdateWrapper<TBcastUnitCard>()
+                .eq("id", id)
+                .eq("del_flag", 0)
+                .and(w -> w.isNull("status").or().eq("status", ST_PENDING));
+        return this.baseMapper.delete(dw);
+    }
+
+    /** 仅「待核对」（含空状态存量旧卡）可撤；已核讫、已压卡均封死 */
+    private boolean isDeletable(Long id) {
+        TBcastUnitCard cur = this.baseMapper.selectById(id);
+        if (cur == null || cur.getDelFlag() == null || cur.getDelFlag().intValue() == 1) {
+            return false;
+        }
+        return cur.getStatus() == null || cur.getStatus().intValue() == ST_PENDING;
     }
 
     // ================= 状态机链 =================
@@ -268,11 +324,11 @@ public class TBcastUnitCardServiceImpl extends ServiceImpl<TBcastUnitCardMapper,
     }
 
     /**
-     * 核验串：由版本序与卡内容共同压死。已核对后定形，覆写不掉。
+     * 本轮核验串：由版本序与卡内容（卡号、应核数）共同压死。
+     * 版本序随退回递增，故退回后再核，新串与旧串必然不同，前后可辨。
      */
     private String checksumOf(TBcastUnitCard cur) {
         Integer node = cur.getNodeNo();
-        String content = cur.getContent() == null ? "" : cur.getContent();
         // 版本序为空的历史卡按 1 计（兼容链）
         int nodeNo = (node == null || node <= 0) ? 1 : node;
         String raw = String.valueOf(nodeNo) + "#" + cur.getBillNo() + "#"
